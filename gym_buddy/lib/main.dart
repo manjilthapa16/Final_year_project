@@ -121,7 +121,7 @@ class _WebViewPageState extends State<WebViewPage> {
     if (kIsWeb) return 'http://localhost:5173';
     switch (defaultTargetPlatform) {
       case TargetPlatform.android:
-        return 'https://192.168.1.66:5173';
+        return 'https://192.168.1.11:5173';
       default:
         return 'http://localhost:5173';
     }

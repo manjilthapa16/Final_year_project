@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import axios from 'axios';
+import { FilesetResolver, PoseLandmarker } from '@mediapipe/tasks-vision';
 
 const isMobile = new URLSearchParams(window.location.search).get('platform') === 'mobile';
 
@@ -9,7 +10,8 @@ const POSES = [
   { value: 'downdog', label: 'Downward Dog' },
   { value: 'tree', label: 'Tree' },
   { value: 'warrior2', label: 'Warrior II' },
-  { value: 'goddess', label: 'Goddess' }
+  { value: 'goddess', label: 'Goddess' },
+  { value: 'sitting', label: 'Sitting' }
 ];
 
 const INTERVAL_OPTIONS = [
@@ -18,8 +20,6 @@ const INTERVAL_OPTIONS = [
   { value: 1800, label: 'Light (1.8s)' }
 ];
 
-const CAPTURE_MAX_WIDTH = 512;
-const CAPTURE_JPEG_QUALITY = 0.65;
 const VOICE_COOLDOWN_MS = 6500;
 const VOICE_COOLDOWN_GOOD_MS = 15000; // positive cues less frequent
 const STABILITY_WINDOW = 5;
@@ -31,12 +31,55 @@ function formatDuration(totalSeconds) {
   return `${minutes}:${String(seconds).padStart(2, '0')}`;
 }
 
+function formatMetricValue(value, suffix = '') {
+  return value === undefined || value === null ? '-' : `${value}${suffix}`;
+}
+
+function buildMetricRows(feedback, selectedPose, lastUpdated) {
+  const metrics = feedback.metrics || {};
+
+  if (selectedPose === 'sitting') {
+    return [
+      ['Neck Tilt', formatMetricValue(metrics.neck_tilt, ' ratio')],
+      ['Shoulder Level', formatMetricValue(metrics.shoulder_tilt, ' ratio')],
+      ['Spine Lean', formatMetricValue(metrics.torso_lean, ' ratio')],
+      ['Spine Extension', formatMetricValue(metrics.spine_extension, ' ratio')],
+      ['Side', metrics.side ?? '-'],
+      ['Visibility', feedback.visibility?.score ?? '-'],
+      ['Issue', feedback.issue ?? feedback.error ?? '-'],
+      ['Source', feedback.source ?? '-'],
+      ['Updated', lastUpdated || '-'],
+    ];
+  }
+
+  const rows = [
+    ['Knee Angle', formatMetricValue(metrics.knee_angle, ' deg')],
+    ['Hip Angle', formatMetricValue(metrics.hip_angle, ' deg')],
+    ['Torso Lean', metrics.torso_lean ?? '-'],
+    ['Side', metrics.side ?? '-'],
+    ['Visibility', feedback.visibility?.score ?? '-'],
+    ['Issue', feedback.issue ?? feedback.error ?? '-'],
+  ];
+
+  if (feedback.phase) {
+    rows.push(['Phase', feedback.phase]);
+  }
+
+  if (feedback.source) {
+    rows.push(['Source', feedback.source]);
+  }
+
+  rows.push(['Updated', lastUpdated || '-']);
+  return rows;
+}
+
 export default function App() {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const canvasCtxRef = useRef(null);
   const cameraStreamRef = useRef(null);
   const coachSectionRef = useRef(null);
+  const poseLandmarkerRef = useRef(null);
   const selectedPoseRef = useRef('squat');
   const lastSpokenRef = useRef({ text: '', at: 0 });
   const voiceEnabledRef = useRef(false);
@@ -44,6 +87,8 @@ export default function App() {
   const feedbackWindowRef = useRef([]);
   const squatTrackerRef = useRef({ seenBottom: false, lastPhase: '', lastRepAt: 0 });
   const runtimeStatsRef = useRef({ count: 0, success: 0, avgLatency: 0 });
+  const feedbackRef = useRef(null);
+  const metricsRef = useRef(null);
 
   const [selectedPose, setSelectedPose] = useState('squat');
   const [intervalMs, setIntervalMs] = useState(1200);
@@ -75,6 +120,42 @@ export default function App() {
   useEffect(() => {
     selectedPoseRef.current = selectedPose;
   }, [selectedPose]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function initMediaPipe() {
+      try {
+        const vision = await FilesetResolver.forVisionTasks(
+          'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm'
+        );
+        const landmarker = await PoseLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath:
+              'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
+            delegate: 'GPU',
+          },
+          runningMode: 'VIDEO',
+          numPoses: 1,
+        });
+        if (!cancelled) {
+          poseLandmarkerRef.current = landmarker;
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setError(`Failed to initialize MediaPipe: ${err.message}`);
+        }
+      }
+    }
+
+    initMediaPipe();
+
+    return () => {
+      cancelled = true;
+      poseLandmarkerRef.current?.close?.();
+      poseLandmarkerRef.current = null;
+    };
+  }, []);
 
   useEffect(() => {
     const cached = localStorage.getItem('ygb-history');
@@ -311,6 +392,8 @@ export default function App() {
     setPoseSeconds(0);
     setSquatReps(0);
     setPoseDetected(false);
+    feedbackRef.current = null;
+    metricsRef.current = null;
     squatTrackerRef.current = { seenBottom: false, lastPhase: '', lastRepAt: 0 };
   }
 
@@ -358,7 +441,7 @@ export default function App() {
   }
 
   async function analyzeFrame({ silent = false } = {}) {
-    if (!videoRef.current || !canvasRef.current || isAnalyzingRef.current) {
+    if (!videoRef.current || isAnalyzingRef.current) {
       return;
     }
 
@@ -371,34 +454,23 @@ export default function App() {
     try {
       const startedAt = performance.now();
       const video = videoRef.current;
-      const canvas = canvasRef.current;
-      const sourceWidth = video.videoWidth || 640;
-      const sourceHeight = video.videoHeight || 480;
-      const scale = Math.min(1, CAPTURE_MAX_WIDTH / sourceWidth);
-      const width = Math.round(sourceWidth * scale);
-      const height = Math.round(sourceHeight * scale);
 
-      canvas.width = width;
-      canvas.height = height;
-
-  const ctx = canvasCtxRef.current || canvas.getContext('2d', { willReadFrequently: true });
-  canvasCtxRef.current = ctx;
-      ctx.drawImage(video, 0, 0, width, height);
-
-      const blob = await new Promise((resolve) => {
-        canvas.toBlob(resolve, 'image/jpeg', CAPTURE_JPEG_QUALITY);
-      });
-
-      if (!blob) {
-        throw new Error('Failed to capture image');
+      if (!poseLandmarkerRef.current) {
+        throw new Error('MediaPipe is still loading');
       }
 
-      const formData = new FormData();
-      formData.append('frame', blob, 'frame.jpg');
-      formData.append('selectedPose', selectedPoseRef.current);
+      const results = poseLandmarkerRef.current.detectForVideo(video, startedAt);
+      const landmarks = results.landmarks?.[0] || [];
 
-      const { data } = await axios.post('/api/analyze', formData, {
-        headers: { 'Content-Type': 'multipart/form-data' }
+      const payload = {
+        selectedPose: selectedPoseRef.current,
+        landmarks,
+        previousFeedback: feedbackRef.current?.feedback,
+        previousMetrics: metricsRef.current,
+      };
+
+      const { data } = await axios.post('/api/analyze', payload, {
+        headers: { 'Content-Type': 'application/json' }
       });
 
       const latencyMs = Math.round(performance.now() - startedAt);
@@ -410,6 +482,8 @@ export default function App() {
       speakFeedback(data.feedback, data.status === 'good');
       if (acceptStableFeedback(data)) {
         setFeedback(data);
+        feedbackRef.current = data;
+        metricsRef.current = data.metrics || null;
       }
     } catch (err) {
       const message = err.response?.data?.detail || err.response?.data?.error || err.message;
@@ -471,6 +545,8 @@ export default function App() {
     setStabilityMessage('');
     setPoseSeconds(0);
     setPoseDetected(false);
+    feedbackRef.current = null;
+    metricsRef.current = null;
     squatTrackerRef.current = { seenBottom: false, lastPhase: '', lastRepAt: 0 };
     lastSpokenRef.current = { text: '', at: 0 };
     if ('speechSynthesis' in window) {
@@ -607,12 +683,12 @@ export default function App() {
           {/* Metrics */}
           {feedback?.success && (
             <div className="m-metrics">
-              <div className="m-metric"><span>Knee Angle</span><strong>{feedback.metrics?.knee_angle ?? '-'}°</strong></div>
-              <div className="m-metric"><span>Hip Angle</span><strong>{feedback.metrics?.hip_angle ?? '-'}°</strong></div>
-              <div className="m-metric"><span>Torso Lean</span><strong>{feedback.metrics?.torso_lean ?? '-'}</strong></div>
-              <div className="m-metric"><span>Side</span><strong>{feedback.metrics?.side ?? '-'}</strong></div>
-              <div className="m-metric"><span>Phase</span><strong>{feedback.phase ?? '-'}</strong></div>
-              <div className="m-metric"><span>Issue</span><strong>{feedback.issue ?? '-'}</strong></div>
+              {buildMetricRows(feedback, selectedPose, lastUpdated).map(([label, value]) => (
+                <div className="m-metric" key={label}>
+                  <span>{label}</span>
+                  <strong>{value}</strong>
+                </div>
+              ))}
             </div>
           )}
 
@@ -829,10 +905,12 @@ export default function App() {
               <span>{selectedPose === 'squat' ? 'Squat Time' : 'Pose Hold'}</span>
               <strong>{formatDuration(poseSeconds)}</strong>
             </p>
-            <p>
-              <span>Squat Reps</span>
-              <strong>{squatReps}</strong>
-            </p>
+            {selectedPose === 'squat' && (
+              <p>
+                <span>Squat Reps</span>
+                <strong>{squatReps}</strong>
+              </p>
+            )}
           </div>
 
           {error && <p className="error">{error}</p>}
@@ -852,14 +930,12 @@ export default function App() {
               <p className="tip">{feedback.feedback}</p>
 
               <div className="metrics">
-                <p><span>Knee Angle</span><strong>{feedback.metrics?.knee_angle ?? '-'} deg</strong></p>
-                <p><span>Hip Angle</span><strong>{feedback.metrics?.hip_angle ?? '-'} deg</strong></p>
-                <p><span>Torso Lean</span><strong>{feedback.metrics?.torso_lean ?? '-'}</strong></p>
-                <p><span>Visible Side</span><strong>{feedback.metrics?.side ?? '-'}</strong></p>
-                <p><span>Visibility</span><strong>{feedback.visibility?.score ?? '-'}</strong></p>
-                <p><span>Issue</span><strong>{feedback.issue ?? feedback.error ?? '-'}</strong></p>
-                <p><span>Phase</span><strong>{feedback.phase ?? '-'}</strong></p>
-                <p><span>Updated</span><strong>{lastUpdated || '-'}</strong></p>
+                {buildMetricRows(feedback, selectedPose, lastUpdated).map(([label, value]) => (
+                  <p key={label}>
+                    <span>{label}</span>
+                    <strong>{value}</strong>
+                  </p>
+                ))}
               </div>
             </>
           )}
